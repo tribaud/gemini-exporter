@@ -1,0 +1,7 @@
+# Exports produits par le script
+*.zip
+gemini-export-*/
+gemini-export-errors-*.json
+/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] *.md
+
+.DS_Store
