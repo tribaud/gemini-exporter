@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Conversation Exporter
 // @namespace    local.gemini-web-exporter
-// @version      0.4.0
+// @version      0.5.0
 // @description  Export Gemini conversations as validated Markdown, one at a time or in batches, using Gemini's own paginated history data.
 // @author       dikelps
 // @license      MIT
@@ -249,8 +249,75 @@
         assistantMarkdown:
           typeof assistantMarkdown === "string" ? assistantMarkdown : "",
         timestamp: timestampToIso(rawTurn?.[4]),
+        // Sans texte, aucune réponse n'est retenue : on fouille alors la
+        // première, celle qu'affiche Gemini.
+        extras: harvestExtras(
+          rawTurn,
+          candidate || rawTurn?.[3]?.[0]?.[0],
+          typeof userMarkdown === "string" ? userMarkdown : "",
+          typeof assistantMarkdown === "string" ? assistantMarkdown : "",
+        ),
         sourceIndex,
       };
+    }
+
+    const URL_PATTERN = /^https?:\/\/\S+$/;
+    const EXTRA_TEXT_MIN_LENGTH = 200;
+
+    function collectStrings(value, path, output) {
+      if (typeof value === "string") {
+        output.push({ path, value });
+      } else if (Array.isArray(value)) {
+        value.forEach((child, index) =>
+          collectStrings(child, `${path}.${index}`, output),
+        );
+      }
+    }
+
+    // Contenu hors du texte principal : images générées, fichiers joints,
+    // Canvas, sources… On ne connaît pas leur emplacement exact dans les
+    // données de Gemini, donc on ramasse dans le prompt et dans la réponse
+    // retenue toute URL et tout texte long qui ne figure pas déjà dans le
+    // texte principal. Le chemin est conservé pour affiner plus tard.
+    function harvestExtras(rawTurn, candidate, userMarkdown, assistantMarkdown) {
+      const strings = [];
+      collectStrings(rawTurn?.[2], "turn.2", strings);
+      collectStrings(candidate, "candidate", strings);
+
+      const mainTexts = [userMarkdown, assistantMarkdown];
+      const isAlreadyShown = (text) =>
+        mainTexts.some((main) => main.includes(text));
+      const seen = new Set();
+      const urls = [];
+      const texts = [];
+
+      for (const { path, value } of strings) {
+        const text = value.trim();
+        if (!text || seen.has(text)) {
+          continue;
+        }
+        seen.add(text);
+
+        if (path === "turn.2.0.0" || path === "candidate.1.0") {
+          continue;
+        }
+        if (URL_PATTERN.test(text)) {
+          if (!isAlreadyShown(text)) {
+            urls.push({ path, url: text });
+          }
+          continue;
+        }
+        // Un texte sans espace est un identifiant ou un jeton, pas du contenu.
+        if (
+          text.length >= EXTRA_TEXT_MIN_LENGTH &&
+          /\s/.test(text) &&
+          !isAlreadyShown(text)
+        ) {
+          texts.push({ path, text });
+        }
+      }
+
+      return { urls, texts };
     }
 
     function historyToChronologicalTurns(rawTurnsNewestFirst) {
@@ -294,7 +361,9 @@
       return (hash >>> 0).toString(16).padStart(8, "0");
     }
 
-    function validateConversation(turns) {
+    // En mode tolérant, les anomalies sont rendues dans diagnostics.problems
+    // au lieu d'arrêter l'export.
+    function validateConversation(turns, { lenient = false } = {}) {
       invariant(Array.isArray(turns), "Exported turns were missing.");
       invariant(turns.length > 0, "Gemini returned no conversation turns.");
 
@@ -405,17 +474,17 @@
         return error;
       }
 
-      if (missing.length > 0) {
+      if (!lenient && missing.length > 0) {
         throw validationError(
           `Export stopped because content was missing: ${missing.join(", ")}.`,
         );
       }
-      if (duplicateResponseIds.length > 0) {
+      if (!lenient && duplicateResponseIds.length > 0) {
         throw validationError(
           "Export stopped because Gemini returned duplicate response IDs.",
         );
       }
-      if (chainBreaks.length > 0) {
+      if (!lenient && chainBreaks.length > 0) {
         throw validationError(
           `Export stopped because the active conversation branch was discontinuous at turn ${chainBreaks[0].turn}.`,
         );
@@ -435,6 +504,7 @@
         duplicateBodies,
         timestampRegressions,
         markdownWarnings,
+        problems,
         fingerprint,
       };
     }
@@ -480,6 +550,45 @@
       return String(text).replace(/([\\[\]])/g, "\\$1");
     }
 
+    // Bloc de code dont la clôture ne peut pas apparaître dans le contenu.
+    function fenceFor(text) {
+      const longestRun = Math.max(
+        0,
+        ...(String(text).match(/~+/g) || []).map((run) => run.length),
+      );
+      return "~".repeat(Math.max(4, longestRun + 1));
+    }
+
+    function renderExtras(extras, { includeMetadata, includeOutline }) {
+      if (!extras || (extras.urls.length === 0 && extras.texts.length === 0)) {
+        return [];
+      }
+
+      const heading = includeOutline ? "####" : "###";
+      const lines = [`${heading} Attachments`, ""];
+
+      for (const { path, url } of extras.urls) {
+        lines.push(
+          `- [${escapeMarkdownLinkText(url.length > 90 ? `${url.slice(0, 90)}…` : url)}](${escapeMarkdownLinkDestination(url)})${
+            includeMetadata ? ` <!-- ${path} -->` : ""
+          }`,
+        );
+      }
+      if (extras.urls.length > 0) {
+        lines.push("");
+      }
+
+      for (const { path, text } of extras.texts) {
+        const fence = fenceFor(text);
+        if (includeMetadata) {
+          lines.push(`<!-- gemini-export-extra: ${path} -->`);
+        }
+        lines.push(`${fence}text`, normalizeBlock(text), fence, "");
+      }
+
+      return lines;
+    }
+
     function renderMarkdown({
       title,
       sourceUrl,
@@ -505,8 +614,11 @@
           `> Conversation: ${conversationId}`,
           `> Turns: ${turns.length}`,
           `> Validation fingerprint: \`${diagnostics.fingerprint}\``,
-          "",
         );
+        for (const problem of diagnostics.problems || []) {
+          lines.push(`> Warning: turn ${problem.turn}, ${problem.kind}`);
+        }
+        lines.push("");
       }
 
       if (includeOutline) {
@@ -550,7 +662,14 @@
           lines.push("## User", "");
         }
 
-        lines.push(normalizeBlock(turn.userMarkdown), "");
+        const hasExtras =
+          turn.extras?.urls.length > 0 || turn.extras?.texts.length > 0;
+        lines.push(
+          turn.userMarkdown.trim()
+            ? normalizeBlock(turn.userMarkdown)
+            : `_[No text in this prompt: non-text content${hasExtras ? ", see attachments below" : " that could not be exported"}]_`,
+          "",
+        );
 
         if (includeOutline) {
           lines.push("### Gemini", "");
@@ -558,7 +677,14 @@
           lines.push("## Gemini", "");
         }
 
-        lines.push(normalizeBlock(turn.assistantMarkdown), "");
+        lines.push(
+          turn.assistantMarkdown.trim()
+            ? normalizeBlock(turn.assistantMarkdown)
+            : `_[No text in this answer: non-text content${hasExtras ? ", see attachments below" : " that could not be exported"}]_`,
+          "",
+        );
+
+        lines.push(...renderExtras(turn.extras, { includeMetadata, includeOutline }));
       });
 
       return `${lines.join("\n").replace(/\n{4,}/g, "\n\n\n").trim()}\n`;
@@ -835,6 +961,7 @@
     collapsed: "ui.collapsed",
     includeMetadata: "export.includeMetadata",
     includeOutline: "export.includeOutline",
+    lenient: "export.lenient",
     batchAsZip: "batch.asZip",
     batchCatalog: "batch.catalog",
     batchExported: "batch.exported",
@@ -1039,7 +1166,9 @@
       report.turnCount = turns.length;
 
       report.stage = "validate";
-      const diagnostics = Core.validateConversation(turns);
+      const diagnostics = Core.validateConversation(turns, {
+        lenient: preferences.lenient,
+      });
 
       report.stage = "render";
       const markdown = Core.renderMarkdown({
@@ -1053,7 +1182,38 @@
         includeOutline: preferences.includeOutline,
       });
 
-      return { markdown, turns, diagnostics, pages: history.pages.length };
+      // Anomalies tolérées : même détail que pour un échec, pour pouvoir
+      // affiner plus tard la lecture des contenus non textuels.
+      let warnings = null;
+      if (diagnostics.problems.length > 0) {
+        const problems = diagnostics.problems.map((problem) => {
+          const turn = turns[problem.turn - 1];
+          return {
+            ...problem,
+            hint: Core.PROBLEM_HINTS[problem.kind] || null,
+            extras: turn?.extras,
+            rawTurn: Core.describeValue(
+              history.rawTurnsNewestFirst[problem.sourceIndex],
+            ),
+          };
+        });
+        warnings = { summary: failureSummary({ problems }), problems };
+        console.groupCollapsed(
+          `[Gemini Exporter] ⚠ ${title}: exported with warnings, ${warnings.summary}`,
+        );
+        for (const problem of problems) {
+          console.warn(`turn ${problem.turn}: ${problem.kind}. ${problem.hint || ""}`, problem);
+        }
+        console.groupEnd();
+      }
+
+      return {
+        markdown,
+        turns,
+        diagnostics,
+        warnings,
+        pages: history.pages.length,
+      };
     } catch (error) {
       report.message = errorMessage(error);
       if (error?.httpStatus) {
@@ -1751,6 +1911,7 @@
         true,
       ),
       batchAsZip: readBooleanPreference(PREFERENCE_KEYS.batchAsZip, true),
+      lenient: readBooleanPreference(PREFERENCE_KEYS.lenient, true),
     };
     const state = {
       catalog: readPreference(PREFERENCE_KEYS.batchCatalog, [], Array.isArray),
@@ -1760,6 +1921,8 @@
       // Statut de chaque conversation pendant l'export en cours :
       // queued, active, done ou failed.
       runStatus: new Map(),
+      // Conversations exportées avec avertissements pendant l'export en cours.
+      runWarnings: new Map(),
       displayLimit: 0,
       sidebarExhausted: false,
       loading: false,
@@ -1803,6 +1966,16 @@
         writeBooleanPreference(PREFERENCE_KEYS.includeMetadata, value);
       },
     });
+    const lenientOption = createOption({
+      label: "Tolerant export",
+      description:
+        "Export even when a turn has no text (image, Canvas…), with a warning and attachments",
+      checked: preferences.lenient,
+      onChange(value) {
+        preferences.lenient = value;
+        writeBooleanPreference(PREFERENCE_KEYS.lenient, value);
+      },
+    });
     const openPickerButton = createActionButton(
       "Export several conversations…",
       "action-button primary",
@@ -1813,6 +1986,7 @@
       createElement("p", "panel-heading", "Export options"),
       outlineOption.option,
       metadataOption.option,
+      lenientOption.option,
       openPickerButton,
       compactToggle,
     );
@@ -1985,7 +2159,9 @@
         return ["", "Exporting…"];
       }
       if (status === "done") {
-        return ["", "✓ Exported"];
+        return state.runWarnings.has(conversation.id)
+          ? ["", "⚠ Exported with warnings"]
+          : ["", "✓ Exported"];
       }
       const failure = state.failed[conversation.id];
       if (status === "failed") {
@@ -1994,7 +2170,10 @@
 
       const exported = state.exported[conversation.id];
       if (exported) {
-        return ["exported", `Exported ${formatDate(exported.at)}`];
+        return [
+          "exported",
+          `${exported.warnings ? "⚠ " : ""}Exported ${formatDate(exported.at)}`,
+        ];
       }
       if (failure) {
         return ["failed", `✗ ${shortCause(failure)}`];
@@ -2071,8 +2250,13 @@
       }
       const badge = createElement("span", "row-badge", badgeText);
       const failure = state.failed[conversation.id];
-      if (failure) {
+      const warnings =
+        state.runWarnings.get(conversation.id) ||
+        state.exported[conversation.id]?.warnings;
+      if (failure && !state.exported[conversation.id]) {
         badge.title = failureTooltip(failure);
+      } else if (warnings) {
+        badge.title = `${warnings}\nSee the warnings at the top of the Markdown file.`;
       }
 
       row.append(checkbox, title, badge);
@@ -2264,6 +2448,7 @@
       state.running = true;
       state.stopRequested = false;
       state.runStatus = new Map(queue.map((conversation) => [conversation.id, "queued"]));
+      state.runWarnings = new Map();
       progress.hidden = false;
       const zipFiles = [];
       const usedNames = new Set();
@@ -2275,6 +2460,7 @@
           at: new Date().toISOString(),
           turns: result.turns.length,
           fingerprint: result.diagnostics.fingerprint,
+          warnings: result.warnings?.summary || null,
         };
         delete state.failed[conversation.id];
       }
@@ -2321,6 +2507,9 @@
               saveState();
             }
             done += 1;
+            if (result.warnings) {
+              state.runWarnings.set(conversation.id, result.warnings.summary);
+            }
             state.runStatus.set(conversation.id, "done");
             state.selected.delete(conversation.id);
           } catch (error) {
@@ -2361,7 +2550,12 @@
         const processed = done + failures.length;
         const stopped = state.stopRequested ? " (stopped)" : "";
         setProgress({ index: processed, total: queue.length, current: "", done, failed: failures.length });
-        progressText.textContent = `Finished${stopped}: ${done} exported, ${failures.length} failed.`;
+        const warned = queue.filter((conversation) =>
+          state.runWarnings.has(conversation.id),
+        ).length;
+        progressText.textContent = `Finished${stopped}: ${done} exported${
+          warned ? ` (${warned} with warnings)` : ""
+        }, ${failures.length} failed.`;
 
         if (failures.length > 0) {
           // Vue d'ensemble dans la console : un échec par ligne, avec le
@@ -2484,7 +2678,13 @@
         showToast(
           `Exported ${result.turns.length} turns from ${result.pages} page${
             result.pages === 1 ? "" : "s"
-          }. Validation: ${result.diagnostics.fingerprint}.`,
+          }. Validation: ${result.diagnostics.fingerprint}.${
+            result.warnings
+              ? `\nWarnings: ${result.warnings.summary}. Details in the console (F12).`
+              : ""
+          }`,
+          "success",
+          result.warnings ? 15_000 : 8_000,
         );
       } catch (error) {
         const report = logExportFailure(error);
