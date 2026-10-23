@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         Gemini Conversation Exporter
 // @namespace    local.gemini-web-exporter
-// @version      0.6.1
+// @version      0.6.2
 // @description  Export Gemini conversations as validated Markdown, one at a time or in batches, using Gemini's own paginated history data.
-// @author       dikelps
+// @author       dikelps, tribaud
 // @license      MIT
-// @homepageURL  https://github.com/dikelps/gemini-conversation-exporter
-// @supportURL   https://github.com/dikelps/gemini-conversation-exporter/issues
+// @homepageURL  https://github.com/tribaud/gemini-exporter
+// @supportURL   https://github.com/tribaud/gemini-exporter/issues
+// @updateURL    https://raw.githubusercontent.com/tribaud/gemini-exporter/master/gemini-conversation-exporter.user.js
+// @downloadURL  https://raw.githubusercontent.com/tribaud/gemini-exporter/master/gemini-conversation-exporter.user.js
 // @match        https://gemini.google.com/*
 // @match        https://gemini.google.com/app
 // @match        https://gemini.google.com/app/*
