@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Conversation Exporter
 // @namespace    local.gemini-web-exporter
-// @version      0.5.0
+// @version      0.6.0
 // @description  Export Gemini conversations as validated Markdown, one at a time or in batches, using Gemini's own paginated history data.
 // @author       dikelps
 // @license      MIT
@@ -262,6 +262,27 @@
     }
 
     const URL_PATTERN = /^https?:\/\/\S+$/;
+    // Icônes de sites et miniatures servies par Google : du décor, pas une
+    // source.
+    const DECORATIVE_HOST_PATTERN = /(^|\.)(gstatic\.com|ytimg\.com|ggpht\.com)$/i;
+
+    function isDecorativeUrl(url) {
+      try {
+        const parsed = new URL(url);
+        return (
+          DECORATIVE_HOST_PATTERN.test(parsed.hostname) ||
+          /favicon/i.test(parsed.pathname)
+        );
+      } catch {
+        return true;
+      }
+    }
+
+    // Une même page citée avec plusieurs ancres (#:~:text=…) ne compte qu'une
+    // fois.
+    function urlWithoutFragment(url) {
+      return url.replace(/#.*$/, "");
+    }
     const EXTRA_TEXT_MIN_LENGTH = 200;
 
     function collectStrings(value, path, output) {
@@ -288,6 +309,7 @@
       const isAlreadyShown = (text) =>
         mainTexts.some((main) => main.includes(text));
       const seen = new Set();
+      const seenPages = new Set();
       const urls = [];
       const texts = [];
 
@@ -302,7 +324,13 @@
           continue;
         }
         if (URL_PATTERN.test(text)) {
-          if (!isAlreadyShown(text)) {
+          const page = urlWithoutFragment(text);
+          if (
+            !isDecorativeUrl(text) &&
+            !seenPages.has(page) &&
+            !isAlreadyShown(page)
+          ) {
+            seenPages.add(page);
             urls.push({ path, url: text });
           }
           continue;
@@ -361,6 +389,35 @@
       return (hash >>> 0).toString(16).padStart(8, "0");
     }
 
+    // Délai maximal entre une réponse vide et l'échange suivant pour y voir
+    // une interruption (l'utilisateur a repris la parole).
+    const INTERRUPTION_MAX_GAP_MS = 30_000;
+
+    // Reconnaît les vides propres aux sessions vocales :
+    // - au premier échange, Gemini parle sans question (« Bonjour ! »), ou un
+    //   échange entièrement vide ouvre la session ;
+    // - en cours de route, une réponse vide suivie de près par l'échange
+    //   suivant : l'utilisateur a coupé la parole à Gemini.
+    function voiceSessionNote(turns, index) {
+      const turn = turns[index];
+      const hasUser = turn.userMarkdown.trim().length > 0;
+      const hasAnswer = turn.assistantMarkdown.trim().length > 0;
+
+      if (index === 0 && !hasUser) {
+        return hasAnswer ? "gemini-spoke-first" : "voice-session-start";
+      }
+
+      const next = turns[index + 1];
+      if (hasUser && !hasAnswer && next && turn.timestamp && next.timestamp) {
+        const gap = Date.parse(next.timestamp) - Date.parse(turn.timestamp);
+        if (gap >= 0 && gap <= INTERRUPTION_MAX_GAP_MS) {
+          return "interrupted-answer";
+        }
+      }
+
+      return null;
+    }
+
     // En mode tolérant, les anomalies sont rendues dans diagnostics.problems
     // au lieu d'arrêter l'export.
     function validateConversation(turns, { lenient = false } = {}) {
@@ -377,9 +434,21 @@
       const markdownWarnings = [];
       // Détail structuré de chaque anomalie bloquante, pour le diagnostic.
       const problems = [];
+      // Vides normaux d'une session vocale (Gemini Live) : signalés dans le
+      // fichier, mais ni bloquants ni comptés comme avertissements.
+      const notes = [];
 
       turns.forEach((turn, index) => {
-        if (!turn.userMarkdown.trim()) {
+        const voiceNote = voiceSessionNote(turns, index);
+        if (voiceNote) {
+          notes.push({ kind: voiceNote, turn: index + 1 });
+        }
+        const userIsExplained =
+          voiceNote === "gemini-spoke-first" || voiceNote === "voice-session-start";
+        const answerIsExplained =
+          voiceNote === "interrupted-answer" || voiceNote === "voice-session-start";
+
+        if (!turn.userMarkdown.trim() && !userIsExplained) {
           missing.push(`turn ${index + 1} user message`);
           problems.push({
             kind: "missing-user-message",
@@ -388,7 +457,7 @@
             sourceIndex: turn.sourceIndex,
           });
         }
-        if (!turn.assistantMarkdown.trim()) {
+        if (!turn.assistantMarkdown.trim() && !answerIsExplained) {
           missing.push(`turn ${index + 1} Gemini response`);
           problems.push({
             kind: "missing-gemini-response",
@@ -505,6 +574,7 @@
         timestampRegressions,
         markdownWarnings,
         problems,
+        notes,
         fingerprint,
       };
     }
@@ -550,6 +620,17 @@
       return String(text).replace(/([\\[\]])/g, "\\$1");
     }
 
+    const VOICE_PLACEHOLDERS = Object.freeze({
+      "gemini-spoke-first": { user: "Gemini spoke first (voice session)" },
+      "voice-session-start": {
+        user: "voice session start",
+        answer: "voice session start",
+      },
+      "interrupted-answer": {
+        answer: "interrupted before Gemini replied (voice session)",
+      },
+    });
+
     // Bloc de code dont la clôture ne peut pas apparaître dans le contenu.
     function fenceFor(text) {
       const longestRun = Math.max(
@@ -559,31 +640,49 @@
       return "~".repeat(Math.max(4, longestRun + 1));
     }
 
+    // Libellé court d'un lien : domaine et début du chemin, sans le bruit des
+    // paramètres de requête.
+    function linkLabel(url) {
+      try {
+        const parsed = new URL(url);
+        const label = `${parsed.hostname.replace(/^www\./, "")}${
+          parsed.pathname === "/" ? "" : decodeURIComponent(parsed.pathname)
+        }`;
+        return label.length > 80 ? `${label.slice(0, 80)}…` : label;
+      } catch {
+        return url.length > 80 ? `${url.slice(0, 80)}…` : url;
+      }
+    }
+
     function renderExtras(extras, { includeMetadata, includeOutline }) {
       if (!extras || (extras.urls.length === 0 && extras.texts.length === 0)) {
         return [];
       }
 
       const heading = includeOutline ? "####" : "###";
-      const lines = [`${heading} Attachments`, ""];
+      const lines = [];
 
-      for (const { path, url } of extras.urls) {
-        lines.push(
-          `- [${escapeMarkdownLinkText(url.length > 90 ? `${url.slice(0, 90)}…` : url)}](${escapeMarkdownLinkDestination(url)})${
-            includeMetadata ? ` <!-- ${path} -->` : ""
-          }`,
-        );
-      }
       if (extras.urls.length > 0) {
+        lines.push(`${heading} Sources`, "");
+        for (const { path, url } of extras.urls) {
+          lines.push(
+            `- [${escapeMarkdownLinkText(linkLabel(url))}](${escapeMarkdownLinkDestination(url)})${
+              includeMetadata ? ` <!-- ${path} -->` : ""
+            }`,
+          );
+        }
         lines.push("");
       }
 
-      for (const { path, text } of extras.texts) {
-        const fence = fenceFor(text);
-        if (includeMetadata) {
-          lines.push(`<!-- gemini-export-extra: ${path} -->`);
+      if (extras.texts.length > 0) {
+        lines.push(`${heading} Additional content`, "");
+        for (const { path, text } of extras.texts) {
+          const fence = fenceFor(text);
+          if (includeMetadata) {
+            lines.push(`<!-- gemini-export-extra: ${path} -->`);
+          }
+          lines.push(`${fence}text`, normalizeBlock(text), fence, "");
         }
-        lines.push(`${fence}text`, normalizeBlock(text), fence, "");
       }
 
       return lines;
@@ -606,6 +705,9 @@
         " ",
       );
       const lines = [`# ${safeTitle}`, ""];
+      const notesByTurn = new Map(
+        (diagnostics.notes || []).map((note) => [note.turn, note.kind]),
+      );
 
       if (includeMetadata) {
         lines.push(
@@ -617,6 +719,9 @@
         );
         for (const problem of diagnostics.problems || []) {
           lines.push(`> Warning: turn ${problem.turn}, ${problem.kind}`);
+        }
+        for (const note of diagnostics.notes || []) {
+          lines.push(`> Note: turn ${note.turn}, ${note.kind}`);
         }
         lines.push("");
       }
@@ -664,10 +769,14 @@
 
         const hasExtras =
           turn.extras?.urls.length > 0 || turn.extras?.texts.length > 0;
+        const missingText = `non-text content${
+          hasExtras ? ", see below" : " that could not be exported"
+        }`;
+        const voiceNote = notesByTurn.get(index + 1);
         lines.push(
           turn.userMarkdown.trim()
             ? normalizeBlock(turn.userMarkdown)
-            : `_[No text in this prompt: non-text content${hasExtras ? ", see attachments below" : " that could not be exported"}]_`,
+            : `_[No prompt: ${VOICE_PLACEHOLDERS[voiceNote]?.user || missingText}]_`,
           "",
         );
 
@@ -680,7 +789,7 @@
         lines.push(
           turn.assistantMarkdown.trim()
             ? normalizeBlock(turn.assistantMarkdown)
-            : `_[No text in this answer: non-text content${hasExtras ? ", see attachments below" : " that could not be exported"}]_`,
+            : `_[No answer: ${VOICE_PLACEHOLDERS[voiceNote]?.answer || missingText}]_`,
           "",
         );
 
