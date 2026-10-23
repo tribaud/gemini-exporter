@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Conversation Exporter
 // @namespace    local.gemini-web-exporter
-// @version      0.6.3
+// @version      0.7.0
 // @description  Export Gemini conversations as validated Markdown, one at a time or in batches, using Gemini's own paginated history data.
 // @author       dikelps, tribaud
 // @license      MIT
@@ -1098,6 +1098,9 @@
   // Pause entre deux conversations pour ne pas marteler l'API privée.
   const BATCH_DELAY_MS = 1_500;
   const BATCH_DELAY_JITTER_MS = 1_000;
+  // La vérification des nouveaux messages ne lit qu'un échange : pause courte.
+  const CHECK_DELAY_MS = 400;
+  const CHECK_DELAY_JITTER_MS = 300;
   const SIDEBAR_SCROLL_WAIT_MS = 1_200;
   const SIDEBAR_STABLE_ROUNDS = 3;
   const SIDEBAR_MAX_ROUNDS = 300;
@@ -1190,7 +1193,11 @@
     );
   }
 
-  async function fetchHistoryPage(conversationId, cursor) {
+  async function fetchHistoryPage(
+    conversationId,
+    cursor,
+    pageSize = HISTORY_PAGE_SIZE,
+  ) {
     const config = getGeminiConfig();
     const query = new URLSearchParams({
       rpcids: Core.HISTORY_RPC_ID,
@@ -1207,7 +1214,7 @@
     }
     const rpcArguments = [
       conversationId,
-      HISTORY_PAGE_SIZE,
+      pageSize,
       cursor,
       1,
       [0],
@@ -1257,6 +1264,32 @@
     }
 
     return text;
+  }
+
+  // Dernier échange d'une conversation, en une requête d'une seule page d'un
+  // seul échange : l'historique est renvoyé du plus récent au plus ancien.
+  async function fetchLatestTurn(conversationId) {
+    const page = Core.parseHistoryPage(
+      await fetchHistoryPage(conversationId, null, 1),
+    );
+    if (page.rawTurns.length === 0) {
+      throw new Error("Gemini returned no turn for this conversation.");
+    }
+    const turn = Core.extractTurn(page.rawTurns[0], 0);
+    return { responseId: turn.responseId, timestamp: turn.timestamp };
+  }
+
+  // Une conversation exportée a-t-elle reçu des messages depuis ? On compare
+  // l'identifiant du dernier échange quand on l'a, sinon la date d'export
+  // (exports faits avant que cet identifiant soit mémorisé).
+  function hasNewMessages(record, latest) {
+    if (record.lastResponseId && latest.responseId) {
+      return latest.responseId !== record.lastResponseId;
+    }
+    if (!latest.timestamp) {
+      return false;
+    }
+    return Date.parse(latest.timestamp) > Date.parse(record.lastTurnAt || record.at);
   }
 
   // Récupère, valide et rend une conversation, sans rien télécharger.
@@ -1917,6 +1950,10 @@
       color: #6dd58c;
     }
 
+    .row[data-badge="updated"] .row-badge {
+      color: #fdd663;
+    }
+
     .row[data-status="failed"] .row-badge,
     .row[data-badge="failed"] .row-badge {
       color: #f2b8b5;
@@ -2064,6 +2101,8 @@
       runStatus: new Map(),
       // Conversations exportées avec avertissements pendant l'export en cours.
       runWarnings: new Map(),
+      // Nature de l'opération en cours : "export" ou "check".
+      runKind: null,
       displayLimit: 0,
       sidebarExhausted: false,
       loading: false,
@@ -2186,12 +2225,18 @@
     const refreshButton = createActionButton("Refresh");
     refreshButton.title =
       "Reread the sidebar from the top to pick up new conversations";
+    const checkButton = createActionButton("Check for new messages");
+    checkButton.title =
+      "For exported conversations in the list, look for messages added since the export";
+    const selectUpdatedButton = createActionButton("");
     toolbar.append(
       filterInput,
       selectAllButton,
       clearButton,
       hideExportedLabel,
       refreshButton,
+      checkButton,
+      selectUpdatedButton,
     );
 
     const list = createElement("div", "list");
@@ -2294,7 +2339,9 @@
         .filter(
           (conversation) =>
             (!filter || conversation.title.toLowerCase().includes(filter)) &&
+            // Une conversation à réexporter reste visible.
             !(hideExportedInput.checked && state.exported[conversation.id] &&
+              !state.exported[conversation.id].newMessagesAt &&
               !state.runStatus.has(conversation.id)),
         );
     }
@@ -2305,7 +2352,7 @@
         return ["", "Queued"];
       }
       if (status === "active") {
-        return ["", "Exporting…"];
+        return ["", state.runKind === "check" ? "Checking…" : "Exporting…"];
       }
       if (status === "done") {
         return state.runWarnings.has(conversation.id)
@@ -2318,6 +2365,9 @@
       }
 
       const exported = state.exported[conversation.id];
+      if (exported?.newMessagesAt) {
+        return ["updated", `New messages since ${formatDate(exported.at)}`];
+      }
       if (exported) {
         return [
           "exported",
@@ -2450,10 +2500,18 @@
 
       const busy = state.loading || state.running;
       runButton.textContent = state.running
-        ? "Exporting…"
+        ? state.runKind === "check"
+          ? "Checking…"
+          : "Exporting…"
         : `Export ${state.selected.size} selected`;
       runButton.disabled = busy || state.selected.size === 0;
       stopButton.hidden = !state.running;
+      stopButton.disabled = state.stopRequested;
+      const updatedCount = updatedConversations().length;
+      checkButton.disabled = busy;
+      selectUpdatedButton.hidden = updatedCount === 0;
+      selectUpdatedButton.textContent = `Select updated (${updatedCount})`;
+      selectUpdatedButton.disabled = busy;
       const failedCount = Object.keys(state.failed).length;
       reportButton.hidden = failedCount === 0;
       reportButton.textContent = `Error report (${failedCount})`;
@@ -2523,7 +2581,7 @@
       progress.hidden = true;
     }
 
-    function setProgress({ index, total, current, done, failed }) {
+    function setProgress({ index, total, current, done, failed, countsText }) {
       const percent = total === 0 ? 0 : Math.round((index / total) * 100);
       progressFill.style.width = `${percent}%`;
       progressTrack.setAttribute("aria-valuemax", String(total));
@@ -2531,7 +2589,8 @@
       progressText.textContent = current
         ? `${Math.min(index + 1, total)} / ${total}  ·  ${current}`
         : `${index} / ${total}`;
-      progressCounts.textContent = `${done} exported · ${failed} failed`;
+      progressCounts.textContent =
+        countsText || `${done} exported · ${failed} failed`;
     }
 
     function scrollRowIntoView(conversationId) {
@@ -2585,6 +2644,89 @@
       );
     }
 
+    // Conversations du catalogue signalées comme modifiées depuis leur export.
+    function updatedConversations() {
+      return state.catalog.filter(
+        (conversation) => state.exported[conversation.id]?.newMessagesAt,
+      );
+    }
+
+    async function checkForNewMessages() {
+      // Seulement les conversations exportées de la liste affichée.
+      const queue = visibleConversations().filter(
+        (conversation) => state.exported[conversation.id],
+      );
+      if (queue.length === 0) {
+        showToast("No exported conversation in the list to check.");
+        return;
+      }
+
+      state.running = true;
+      state.runKind = "check";
+      state.stopRequested = false;
+      state.runStatus = new Map(queue.map((conversation) => [conversation.id, "queued"]));
+      progress.hidden = false;
+      let updated = 0;
+      let failed = 0;
+
+      try {
+        for (let index = 0; index < queue.length; index += 1) {
+          if (state.stopRequested) {
+            break;
+          }
+
+          const conversation = queue[index];
+          state.runStatus.set(conversation.id, "active");
+          setProgress({
+            index,
+            total: queue.length,
+            current: conversation.title,
+            countsText: `${updated} with new messages · ${failed} failed`,
+          });
+          renderList();
+          scrollRowIntoView(conversation.id);
+
+          try {
+            const latest = await fetchLatestTurn(conversation.id);
+            const record = state.exported[conversation.id];
+            if (hasNewMessages(record, latest)) {
+              record.newMessagesAt = latest.timestamp || new Date().toISOString();
+              updated += 1;
+            } else {
+              delete record.newMessagesAt;
+            }
+            saveState();
+          } catch (error) {
+            failed += 1;
+            console.warn(
+              `[Gemini Exporter] Could not check ${conversation.title}: ${errorMessage(error)}`,
+              error,
+            );
+          }
+          state.runStatus.delete(conversation.id);
+
+          if (index < queue.length - 1 && !state.stopRequested) {
+            await sleep(CHECK_DELAY_MS + Math.random() * CHECK_DELAY_JITTER_MS);
+          }
+        }
+
+        const stopped = state.stopRequested ? " (stopped)" : "";
+        setProgress({
+          index: queue.length,
+          total: queue.length,
+          current: "",
+          countsText: `${updated} with new messages · ${failed} failed`,
+        });
+        progressText.textContent = `Check finished${stopped}: ${updated} of ${queue.length} conversations have new messages.`;
+      } finally {
+        state.running = false;
+        state.runKind = null;
+        state.stopRequested = false;
+        state.runStatus.clear();
+        renderList();
+      }
+    }
+
     async function runSelectedExport() {
       // On garde l'ordre de la liste, pas l'ordre des clics.
       const queue = state.catalog.filter((conversation) =>
@@ -2595,6 +2737,7 @@
       }
 
       state.running = true;
+      state.runKind = "export";
       state.stopRequested = false;
       state.runStatus = new Map(queue.map((conversation) => [conversation.id, "queued"]));
       state.runWarnings = new Map();
@@ -2610,6 +2753,8 @@
           turns: result.turns.length,
           fingerprint: result.diagnostics.fingerprint,
           warnings: result.warnings?.summary || null,
+          lastResponseId: result.turns[result.turns.length - 1]?.responseId || null,
+          lastTurnAt: result.turns[result.turns.length - 1]?.timestamp || null,
         };
         delete state.failed[conversation.id];
       }
@@ -2728,6 +2873,7 @@
         }
       } finally {
         state.running = false;
+        state.runKind = null;
         state.stopRequested = false;
         renderList();
       }
@@ -2773,6 +2919,13 @@
       writeBooleanPreference(PREFERENCE_KEYS.batchAsZip, zipInput.checked);
     });
     runButton.addEventListener("click", runSelectedExport);
+    checkButton.addEventListener("click", checkForNewMessages);
+    selectUpdatedButton.addEventListener("click", () => {
+      for (const conversation of updatedConversations()) {
+        state.selected.add(conversation.id);
+      }
+      renderList();
+    });
     reportButton.addEventListener("click", downloadErrorReport);
     stopButton.addEventListener("click", () => {
       state.stopRequested = true;
