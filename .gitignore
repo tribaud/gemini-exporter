@@ -1,4 +1,5 @@
 # Exports produits par le script
+exports/
 *.zip
 gemini-export-*/
 gemini-export-errors-*.json
