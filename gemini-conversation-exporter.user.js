@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Conversation Exporter
 // @namespace    local.gemini-web-exporter
-// @version      0.6.2
+// @version      0.6.3
 // @description  Export Gemini conversations as validated Markdown, one at a time or in batches, using Gemini's own paginated history data.
 // @author       dikelps, tribaud
 // @license      MIT
@@ -1077,6 +1077,11 @@
   }
 
   const ROOT_ID = "gemini-web-exporter-root";
+  // Version lue dans l'en-tête par Tampermonkey : une seule source de vérité.
+  const SCRIPT_VERSION =
+    typeof GM_info !== "undefined" && GM_info?.script?.version
+      ? GM_info.script.version
+      : null;
   const HISTORY_PAGE_SIZE = 50;
   // Nombre de conversations ajoutées à la liste à chaque « Load more ».
   const LIST_PAGE_SIZE = 50;
@@ -1667,6 +1672,19 @@
       letter-spacing: 0.01em;
     }
 
+    .panel-heading-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .version {
+      color: #9aa0a6;
+      font-size: 11px;
+      font-weight: 500;
+    }
+
     .option {
       display: grid;
       grid-template-columns: 20px minmax(0, 1fr);
@@ -2104,9 +2122,16 @@
       "action-button primary",
     );
     const compactToggle = createActionButton("", "compact-toggle");
+    const panelHeadingRow = createElement("div", "panel-heading-row");
+    panelHeadingRow.append(createElement("p", "panel-heading", "Export options"));
+    if (SCRIPT_VERSION) {
+      panelHeadingRow.append(
+        createElement("span", "version", `v${SCRIPT_VERSION}`),
+      );
+    }
 
     panel.append(
-      createElement("p", "panel-heading", "Export options"),
+      panelHeadingRow,
       outlineOption.option,
       metadataOption.option,
       lenientOption.option,
@@ -2229,7 +2254,8 @@
     function setCollapsed(collapsed, persist = true) {
       preferences.collapsed = collapsed;
       control.dataset.collapsed = String(collapsed);
-      exportButton.title = collapsed ? "Export Markdown" : "";
+      const versionSuffix = SCRIPT_VERSION ? ` (v${SCRIPT_VERSION})` : "";
+      exportButton.title = `Export Markdown${versionSuffix}`;
       compactToggle.textContent = collapsed
         ? "Use expanded control"
         : "Use compact control";
