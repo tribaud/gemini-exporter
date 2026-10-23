@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Conversation Exporter
 // @namespace    local.gemini-web-exporter
-// @version      0.6.0
+// @version      0.6.1
 // @description  Export Gemini conversations as validated Markdown, one at a time or in batches, using Gemini's own paginated history data.
 // @author       dikelps
 // @license      MIT
@@ -397,7 +397,9 @@
     // - au premier échange, Gemini parle sans question (« Bonjour ! »), ou un
     //   échange entièrement vide ouvre la session ;
     // - en cours de route, une réponse vide suivie de près par l'échange
-    //   suivant : l'utilisateur a coupé la parole à Gemini.
+    //   suivant : l'utilisateur a coupé la parole à Gemini ;
+    // - dans une session repérée comme vocale (premier échange sans question),
+    //   une réponse sans question : Gemini a repris la parole après une pause.
     function voiceSessionNote(turns, index) {
       const turn = turns[index];
       const hasUser = turn.userMarkdown.trim().length > 0;
@@ -405,6 +407,11 @@
 
       if (index === 0 && !hasUser) {
         return hasAnswer ? "gemini-spoke-first" : "voice-session-start";
+      }
+
+      const isVoiceSession = !turns[0].userMarkdown.trim();
+      if (index > 0 && !hasUser && hasAnswer && isVoiceSession) {
+        return "gemini-continued";
       }
 
       const next = turns[index + 1];
@@ -444,7 +451,9 @@
           notes.push({ kind: voiceNote, turn: index + 1 });
         }
         const userIsExplained =
-          voiceNote === "gemini-spoke-first" || voiceNote === "voice-session-start";
+          voiceNote === "gemini-spoke-first" ||
+          voiceNote === "voice-session-start" ||
+          voiceNote === "gemini-continued";
         const answerIsExplained =
           voiceNote === "interrupted-answer" || voiceNote === "voice-session-start";
 
@@ -628,6 +637,9 @@
       },
       "interrupted-answer": {
         answer: "interrupted before Gemini replied (voice session)",
+      },
+      "gemini-continued": {
+        user: "Gemini continued speaking after a pause (voice session)",
       },
     });
 
